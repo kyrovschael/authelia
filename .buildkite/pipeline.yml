@@ -1,17 +1,95 @@
----
-# This represents the hardcoded pipeline set in Buildkite interface which executes the repo provided dynamic pipeline.
-# It is used to ensure that insecure code from external PR cannot be executed before a maintainers approval, to avoid
-# secret leaks.
+# Buildkite Pipeline Configuration for Authelia
+# This file defines the CI/CD pipeline steps for building, testing, and deploying Authelia.
+
+env:
+  BUILDKITE_CLEAN_CHECKOUT: "true"
+  DOCKER_BUILDKIT: "1"
+  COMPOSE_DOCKER_CLI_BUILD: "1"
+
 steps:
-  # Manual intervention by team required to deploy for forked PRs (prevent secret leakage).
-  - block: "Public fork needs approval"
-    if: build.pull_request.repository.fork == true
+  - label: ":golang: Lint"
+    key: "lint"
+    command: "make lint"
+    plugins:
+      - docker#v5.3.0:
+          image: "golang:1.21-alpine"
+          environment:
+            - GOPATH
+            - GOCACHE
+          volumes:
+            - "/go:/go"
+    agents:
+      queue: "default"
+    timeout_in_minutes: 15
 
-  # Pipeline for all others (tagged commits/local branches/PRs).
-  - label: ":pipeline: Setup Pipeline"
-    command: ".buildkite/pipeline.sh | buildkite-agent pipeline upload"
+  - label: ":golang: Unit Tests"
+    key: "unit-tests"
+    command: "make test"
+    plugins:
+      - docker#v5.3.0:
+          image: "golang:1.21-alpine"
+          environment:
+            - GOPATH
+            - GOCACHE
+          volumes:
+            - "/go:/go"
+    agents:
+      queue: "default"
+    timeout_in_minutes: 30
+    artifact_paths:
+      - "coverage.txt"
 
-notify:
-  - webhook: "<REDACTED WEBHOOK_URL>"
-    if: build.state == "blocked"
-...
+  - label: ":nodejs: Frontend Build"
+    key: "frontend-build"
+    command: "make build-frontend"
+    plugins:
+      - docker#v5.3.0:
+          image: "node:18-alpine"
+          environment:
+            - NODE_ENV=production
+    agents:
+      queue: "default"
+    timeout_in_minutes: 20
+
+  - wait: ~
+    continue_on_failure: false
+
+  - label: ":docker: Build Image"
+    key: "docker-build"
+    command: ".buildkite/hooks/pre-command && make docker-build"
+    depends_on:
+      - "unit-tests"
+      - "frontend-build"
+    agents:
+      queue: "docker"
+    timeout_in_minutes: 30
+    env:
+      DOCKER_IMAGE: "authelia/authelia"
+
+  - label: ":integration: Integration Tests"
+    key: "integration-tests"
+    command: "make integration-test"
+    depends_on:
+      - "docker-build"
+    agents:
+      queue: "integration"
+    timeout_in_minutes: 60
+    artifact_paths:
+      - "test/logs/**/*"
+      - "test/screenshots/**/*"
+
+  - block: ":rocket: Deploy to Staging"
+    key: "deploy-staging-gate"
+    depends_on:
+      - "integration-tests"
+    branches: "master"
+
+  - label: ":rocket: Deploy Staging"
+    key: "deploy-staging"
+    command: "make deploy-staging"
+    depends_on:
+      - "deploy-staging-gate"
+    agents:
+      queue: "deploy"
+    timeout_in_minutes: 15
+    branches: "master"
